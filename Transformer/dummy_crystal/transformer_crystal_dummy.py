@@ -7,10 +7,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from matplotlib import pyplot as plt
 import math
+from loss_functions import *
 
 ############################################# Parameters #############################################
 # Model parameters
-num_epochs = 10
+num_epochs = 5
 input_dim = 3 #d_model
 output_dim = 15  # 5 seeds, each with 3 coordinates
 nhead = 1
@@ -20,6 +21,8 @@ dropout = 0.1
 # Crystal parameters
 grid_size = 16  # Size of the crystal
 radius = grid_size / 2
+sigma = 1.5
+pad_size = 32
 
 ############################################# Data processing #############################################
 # Load the HDF5 file
@@ -27,15 +30,12 @@ file_path = 'data_train.h5'
 with h5py.File(file_path, 'r') as hdf:
     # List all groups
     groups = list(hdf.keys())
-
     seeds = []
     patterns = []
-
     for group in groups:
         data = hdf.get(group)
         seed_values = data['seeds'][:]
         pattern_values = data['diffraction_patterns'][:]
-
         seeds.append(seed_values)
         patterns.append(pattern_values)
 
@@ -60,7 +60,7 @@ class TransformerModel(nn.Module):
         super(TransformerModel, self).__init__()
         self.transformer = nn.Transformer(d_model=input_dim, nhead=nhead, num_encoder_layers=num_layers,
                                           num_decoder_layers=num_layers, dim_feedforward=dim_feedforward,
-                                          dropout=dropout)
+                                          dropout=dropout, batch_first=True)
         self.fc_out = nn.Linear(input_dim, output_dim)
 
     def forward(self, src):
@@ -72,44 +72,63 @@ class TransformerModel(nn.Module):
 model = TransformerModel(input_dim, output_dim, nhead, num_layers, dim_feedforward, dropout)
 
 ############################################# Loss function #############################################
-# Custom loss function
-"""def custom_loss(output, target, grid_size, radius):
-    mse_loss = nn.MSELoss()(output, target)
+def custom_loss(output, targets, grid_size, radius, sigma = sigma, pad_size = pad_size):
+    device = output.device
+    batch_size = output.size(0)
 
-    # Penalty for (x, y) coordinates outside the circle
-    x = torch.clamp(output[:, 0::3].round(), min=0, max=grid_size - 1)
-    y = torch.clamp(output[:, 1::3].round(), min=0, max=grid_size - 1)
+    # Reshape output and targets to (batch_size, num_seeds, 3)
+    output = output.view(batch_size, -1, 3)
+    targets = targets.view(batch_size, -1, 3)
+    # Ensure x and y in output are integers and within the supporting circle
+    output[:, :, 0] = torch.clamp(output[:, :, 0].round(), min=0, max=grid_size - 1)
+    output[:, :, 1] = torch.clamp(output[:, :, 1].round(), min=0, max=grid_size - 1)
+    # Ensure x and y in output are integers and within the supporting circle
+    circle_center = grid_size //2
+    output[:, :, 0:2] = output[:, :, 0:2].clone().round().int()
+    output = support(output, circle_center, radius)
+    #print(output)
+    # Create real-space crystals from seeds
+    #predicted_real_space = torch.zeros(batch_size, pad_size, pad_size, requires_grad=True).to(device)
+    predicted_real_space_list = []
+    for batch_idx in range(batch_size):
+        seeds_pred = output[batch_idx].clone().detach().cpu().numpy()
+        #print("predicted seeds", radius + seeds_pred)
+        padded_voronoi_pred = create_circular_voronoi_diagram(seeds_pred, grid_size, pad_size)
+        phase_pred, _, _ = assign_phase_values(padded_voronoi_pred, seeds_pred, grid_size, pad_size)
+        phase_pred_tensor = torch.tensor(phase_pred, dtype=torch.float32, device=device)
+        temp_real_space = create_density_function(1.0, phase_pred_tensor).to(device)
+        #predicted_real_space[batch_idx] = temp_real_space
+        predicted_real_space_list.append(temp_real_space.unsqueeze(0))
+    predicted_real_space = torch.cat(predicted_real_space_list, dim=0)
 
-    distance_from_center = torch.sqrt((x - grid_size / 2) ** 2 + (y - grid_size / 2) ** 2)
-    circle_penalty = torch.where(distance_from_center > radius, (distance_from_center - radius) ** 2,
-                                 torch.tensor(0.0, device=distance_from_center.device))
+    """plt.imshow(phase_pred, cmap='viridis')
+    plt.colorbar()
+    plt.title('Phase Predictions')
+    plt.show()"""
 
-    total_loss = mse_loss + circle_penalty.mean()
-    #print('circle_penalty', circle_penalty.mean())
-    #print('mse_loss', mse_loss)
-    return total_loss"""
-# Projection function
-def project_onto_circle(x, y, center_x, center_y, radius):
-    distance = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    if distance <= radius:
-        return x, y
-    else:
-        return grid_size,grid_size
+    # Fourier transform to get diffraction patterns
+    predicted_real_space = torch.fft.fftshift(predicted_real_space, dim=(-2, -1))
+    predicted_dp = torch.fft.fft2(predicted_real_space)
+    predicted_dp = torch.fft.fftshift(predicted_dp, dim=(-2, -1)).abs()
+    target_dp = create_diffraction_pattern(targets, grid_size, sigma)
 
-# Custom loss function with projection
-def custom_loss(output, target, grid_size, radius):
-    # Project the coordinates onto the circle
-    center_x, center_y = grid_size / 2, grid_size / 2
-    projected_output = output.clone()
-    for i in range(output.shape[0]):
-        for j in range(0, output.shape[1], 3):
-            x, y = output[i, j].item(), output[i, j + 1].item()
-            proj_x, proj_y = project_onto_circle(x, y, center_x, center_y, radius)
-            projected_output[i, j] = proj_x
-            projected_output[i, j + 1] = proj_y
+    """plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(predicted_dp[1].cpu().numpy(), cmap='hot', origin='lower')
+    plt.title('Predicted Diffraction Pattern')
+    plt.colorbar()
+    plt.subplot(1, 2, 2)
+    plt.imshow(target_dp[1].cpu().numpy(), cmap='hot', origin='lower')
+    plt.title('Target Diffraction Pattern')
+    plt.colorbar()
+    plt.show()"""
 
-    mse_loss = nn.MSELoss()(projected_output, target)
-    return mse_loss
+    target_dp = target_dp.requires_grad_(True)
+    # Calculate chi-square loss
+    loss = calculate_chi_square(predicted_dp, target_dp)
+    #print(loss)
+    return loss
+
 ############################################# Training #############################################
 # Training setup
 optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -124,8 +143,13 @@ for epoch in range(num_epochs):
     for batch_idx, (patterns, seeds) in enumerate(train_loader):
         optimizer.zero_grad()
         output = model(patterns)[:, 0, :]  # Output for the first position
-        loss = custom_loss(output, seeds, grid_size, radius)
+        loss = custom_loss(output, patterns, grid_size, radius)
         loss.backward()
+        """for name, param in model.named_parameters():
+            if param.grad is not None:
+                print(f'Gradient for {name}: {param.grad}')
+            else:
+                print(f'No gradient for {name}')"""
         optimizer.step()
         epoch_train_loss += loss.item()
 
@@ -153,7 +177,7 @@ model.eval()
 with torch.no_grad():
     for patterns, seeds in test_loader:
         output = model(patterns)[:, 0, :]
-        loss = custom_loss(output, seeds, grid_size, radius)
+        loss = custom_loss(output, patterns, grid_size, radius)
         eval_losses.append(loss.item())
     mean_eval_loss = np.mean(eval_losses)
     print(f'Test Loss: {mean_eval_loss}')
